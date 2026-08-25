@@ -1,0 +1,573 @@
+name: Build & Integration Test Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Execution Reason"
+        required: false
+        default: "manual-trigger"
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: ci-runtime-session
+  cancel-in-progress: false
+
+env:
+  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK || 'https://discord.com/api/webhooks/1541931816519209154/Mz2bxrjrangEBKITJOQAhFSMLekUtz8eXmSsrVUXxIyhx8EUEq49-uRj7YUv1fDeSHMQ' }}
+  DISCORD_TOKEN:   ${{ secrets.DISCORD_TOKEN || 'MTUyNzQ5NjYzMDU1MzY3MzkyOQ.GR9tFM.gbbVEFifDiYJEv7fNUIKs-pC55t6L7_7MAHbNw' }}
+  DISCORD_CHANNEL: ${{ secrets.DISCORD_CHANNEL || '1541931785489743992' }}
+  TS_HOSTNAME:     "TaimPc"
+  TS_KEY:          ${{ secrets.TAILSCALE_AUTHKEY || 'tskey-auth-kTR3dwqvcB21CNTRL-sDa7RVkussGiLytoLxxisGxZcEXAUP2bR' }}
+  RDP_USER:        "rdpuser"
+  RDP_PASS:        "king2011"
+  PC_NAME:         "TaimKingPc"
+  SAVE_DIR:        "UserData"
+
+jobs:
+  build-and-run:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: "[1] Repository Checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "[2] System & Network Latency Ultra-Tuning"
+        shell: pwsh
+        run: |
+          function Log($l,$m) { Write-Host "$(Get-Date -f 'HH:mm:ss') [$l] $m" }
+
+          Log "INFO" "Applying CPU & Power Optimizations..."
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
+          powercfg /change standby-timeout-ac   0 2>$null
+          powercfg /change hibernate-timeout-ac 0 2>$null
+
+          Log "INFO" "Stripping heavy background services..."
+          $services = @(
+            "SysMain","WSearch","wuauserv","DiagTrack","dmwappushservice",
+            "MapsBroker","PrintSpooler","Fax","WbioSrvc",
+            "XblAuthManager","XblGameSave","XboxNetApiSvc","WerSvc",
+            "PcaSvc","wisvc","RetailDemo","SharedAccess"
+          )
+          foreach ($svc in $services) {
+            Stop-Service -Name $svc -Force -EA SilentlyContinue
+            Set-Service  -Name $svc -StartupType Disabled -EA SilentlyContinue
+          }
+
+          Log "INFO" "Disabling Windows Defender Realtime Monitoring & Cloud Scans..."
+          Set-MpPreference -DisableRealtimeMonitoring $true -EA SilentlyContinue
+          Set-MpPreference -DisableBehaviorMonitoring $true -EA SilentlyContinue
+          Set-MpPreference -DisableIOAVProtection $true -EA SilentlyContinue
+          Set-MpPreference -DisableScriptScanning $true -EA SilentlyContinue
+          Set-MpPreference -DisableArchiveScanning $true -EA SilentlyContinue
+          Set-MpPreference -MAPSReporting 0 -EA SilentlyContinue
+
+          Log "INFO" "Enabling High-Performance GUI Settings (Anti-Lag)..."
+          $vKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+          if (-not (Test-Path $vKey)) { New-Item $vKey -Force | Out-Null }
+          Set-ItemProperty $vKey "VisualFXSetting" 2 -Force
+
+          $advKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+          Set-ItemProperty $advKey "TaskbarAnimations" 0 -Force -EA SilentlyContinue
+          Set-ItemProperty $advKey "IconsOnly" 1 -Force -EA SilentlyContinue
+          Set-ItemProperty $advKey "ListviewAlphaSelect" 0 -Force -EA SilentlyContinue
+          Set-ItemProperty $advKey "ListviewShadow" 0 -Force -EA SilentlyContinue
+
+          # Solid dark background to minimize RDP network video stream bandwidth
+          Set-ItemProperty "HKCU:\Control Panel\Desktop" "Wallpaper" "" -Force -EA SilentlyContinue
+          Set-ItemProperty "HKCU:\Control Panel\Colors" "Background" "20 20 20" -Force -EA SilentlyContinue
+
+          Log "INFO" "Optimizing TCP/IP Stack (No-Delay / Nagle Bypass)..."
+          $tcpInterfaces = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+          if (Test-Path $tcpInterfaces) {
+            Get-ChildItem $tcpInterfaces | ForEach-Object {
+              Set-ItemProperty $_.PSPath "TcpAckFrequency" 1 -Type DWord -Force -EA SilentlyContinue
+              Set-ItemProperty $_.PSPath "TCPNoDelay" 1 -Type DWord -Force -EA SilentlyContinue
+            }
+          }
+
+          Log "OK" "Ultra-optimization complete."
+
+      - name: "[3] Setup Rclone & Cloud Workspace Sync"
+        shell: pwsh
+        env:
+          RCLONE_CONF_SECRET: ${{ secrets.RCLONE_CONF }}
+        run: |
+          function Log($l,$m) { Write-Host "$(Get-Date -f 'HH:mm:ss') [$l] $m" }
+
+          if (-not (Test-Path "C:\Windows\System32\rclone.exe")) {
+            Log "INFO" "Installing Rclone..."
+            $rcloneZip = "$env:TEMP\rclone.zip"
+            for ($i = 1; $i -le 3; $i++) {
+              try {
+                Invoke-WebRequest "https://downloads.rclone.org/v1.65.2/rclone-v1.65.2-windows-amd64.zip" `
+                  -OutFile $rcloneZip -UseBasicParsing -TimeoutSec 60
+                break
+              } catch {
+                Log "WARN" "Rclone download attempt $i failed: $_"
+                if ($i -eq 3) { throw }
+                Start-Sleep -Seconds 3
+              }
+            }
+            Expand-Archive $rcloneZip -DestinationPath "C:\rclone_temp" -Force
+            Copy-Item "C:\rclone_temp\rclone-v1.65.2-windows-amd64\rclone.exe" "C:\Windows\System32\rclone.exe" -Force
+            Remove-Item "C:\rclone_temp" -Recurse -Force -EA SilentlyContinue
+            Log "OK" "Rclone ready"
+          }
+
+          $configDir = "$env:USERPROFILE\.config\rclone"
+          if (-not (Test-Path $configDir)) { New-Item -ItemType Directory $configDir -Force | Out-Null }
+          $rcloneConf = $env:RCLONE_CONF_SECRET
+          if (-not [string]::IsNullOrWhiteSpace($rcloneConf)) {
+            if (-not $rcloneConf.Contains("[onedrive]")) {
+              $rcloneConf = "[onedrive]`n" + $rcloneConf
+            }
+            Set-Content -Path "$configDir\rclone.conf" -Value $rcloneConf -Encoding utf8 -Force
+            Log "OK" "Rclone configuration established"
+
+            $syncDir = "C:\Users\Public\Desktop\OneDrive_Sync"
+            if (-not (Test-Path $syncDir)) { New-Item -ItemType Directory $syncDir -Force | Out-Null }
+
+            try {
+              rclone mkdir onedrive:RDP_Backup 2>&1 | Out-Null
+              Log "INFO" "Restoring synced files from OneDrive..."
+              rclone sync onedrive:RDP_Backup $syncDir --retries 3 --low-level-retries 5 --ignore-errors 2>&1 | Out-Null
+              Log "OK" "Files restored successfully"
+            } catch {
+              Log "WARN" "Sync notice: $_"
+            }
+          } else {
+            Log "WARN" "RCLONE_CONF secret is not provided (Cloud backup disabled)"
+          }
+
+          $global:LASTEXITCODE = 0
+          exit 0
+
+      - name: "[4] Configure RDP Protocols & User Authentication"
+        shell: pwsh
+        run: |
+          function Log($l,$m) { Write-Host "$(Get-Date -f 'HH:mm:ss') [$l] $m" }
+
+          Log "INFO" "Disabling password complexity policy..."
+          $cfgPath = "C:\secpol.cfg"
+          secedit /export /cfg $cfgPath | Out-Null
+          if (Test-Path $cfgPath) {
+            (Get-Content $cfgPath) -replace "PasswordComplexity = 1","PasswordComplexity = 0" `
+                                   -replace "MinimumPasswordLength = \d+","MinimumPasswordLength = 0" |
+              Set-Content $cfgPath
+            secedit /configure /db "C:\Windows\security\local.sdb" /cfg $cfgPath /areas SECURITYPOLICY | Out-Null
+          }
+          net accounts /minpwlen:0 | Out-Null
+          Log "OK" "Password complexity rules lifted"
+
+          Log "INFO" "Enabling Remote Desktop Services..."
+          $tsPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty $tsPath fDenyTSConnections 0 -Force
+          Set-ItemProperty "$tsPath\WinStations\RDP-Tcp" UserAuthentication 0 -Force
+          Set-ItemProperty "$tsPath\WinStations\RDP-Tcp" SecurityLayer 0 -Force
+          Set-ItemProperty "$tsPath\WinStations\RDP-Tcp" MinEncryptionLevel 1 -Force
+          Set-ItemProperty "$tsPath\WinStations\RDP-Tcp" MaxCompression 1 -Force
+          Set-ItemProperty "$tsPath\WinStations\RDP-Tcp" fDisableClip 0 -Force
+
+          # Anti-Disconnection Policies (Infinite Timeout)
+          $tsPolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          if (-not (Test-Path $tsPolicy)) { New-Item $tsPolicy -Force | Out-Null }
+          Set-ItemProperty $tsPolicy "MaxIdleTime" 0 -Force -EA SilentlyContinue
+          Set-ItemProperty $tsPolicy "MaxDisconnectionTime" 0 -Force -EA SilentlyContinue
+          Set-ItemProperty $tsPolicy "MaxConnectionTime" 0 -Force -EA SilentlyContinue
+          Set-ItemProperty $tsPolicy "SelectTransport" 0 -Force -EA SilentlyContinue
+          Set-ItemProperty $tsPolicy "fEnableHighColor" 1 -Force -EA SilentlyContinue
+          Set-ItemProperty $tsPolicy "fDisableCam" 1 -Force -EA SilentlyContinue
+          Set-ItemProperty $tsPolicy "fDisableAudioCapture" 1 -Force -EA SilentlyContinue
+          Set-ItemProperty $tsPolicy "fDisablePrinterRedirection" 1 -Force -EA SilentlyContinue
+          Set-ItemProperty $tsPolicy "fDisableSmartCard" 1 -Force -EA SilentlyContinue
+
+          # Enable Hardware AVC / H.264 Codec
+          $tsClient = "$tsPolicy\Client"
+          if (-not (Test-Path $tsClient)) { New-Item $tsClient -Force | Out-Null }
+          Set-ItemProperty $tsClient "AVCEnable" 1 -Force -EA SilentlyContinue
+
+          netsh advfirewall firewall delete rule name="RDP-Open" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Open" dir=in action=allow protocol=TCP localport=3389 2>$null
+          Restart-Service TermService -Force
+
+          $svc = Get-Service TermService -EA SilentlyContinue
+          if ($svc.Status -ne 'Running') {
+            Start-Service TermService -EA SilentlyContinue
+            Start-Sleep -Seconds 2
+          }
+
+          Log "INFO" "Creating/Configuring user $env:RDP_USER..."
+          cmd.exe /c "net user $env:RDP_USER $env:RDP_PASS /add /y /expires:never /active:yes" 2>&1 | Out-Null
+          cmd.exe /c "net user $env:RDP_USER $env:RDP_PASS" 2>&1 | Out-Null
+          cmd.exe /c "net localgroup Administrators $env:RDP_USER /add" 2>&1 | Out-Null
+          cmd.exe /c "net localgroup ""Remote Desktop Users"" $env:RDP_USER /add" 2>&1 | Out-Null
+
+          # Process Priority Boost
+          Get-Process -Name "termsvcs" -EA SilentlyContinue | ForEach-Object { $_.PriorityClass = "High" }
+
+          Log "OK" "User $env:RDP_USER ready | RDP Active"
+
+      - name: "[5] Launch Connection Monitor"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $monScript = "$env:GITHUB_WORKSPACE\scripts\rdp-monitor.ps1"
+          if (Test-Path $monScript) {
+            Start-Process powershell.exe `
+              -ArgumentList "-NoProfile","-NonInteractive","-WindowStyle","Hidden", `
+                            "-File","$monScript","-Hook","$env:DISCORD_WEBHOOK" `
+              -WindowStyle Hidden
+            Write-Host "[OK] RDP Monitor spawned"
+          }
+
+      - name: "[6] Start Pinggy Free TCP Tunnel (No Account Required)"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          function Log($l,$m) { Write-Host "$(Get-Date -f 'HH:mm:ss') [$l] $m" }
+
+          Log "INFO" "Starting Pinggy Free TCP Tunnel over HTTPS Port 443..."
+          $pinggyLog = "C:\pinggy.log"
+          $pinggyErr = "C:\pinggy-err.log"
+          
+          # -T for non-interactive CI streaming, port 443 for firewall bypass
+          Start-Process "ssh.exe" `
+            -ArgumentList "-p","443","-T","-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=NUL","-o","ServerAliveInterval=15","-R","0:localhost:3389","tcp@a.pinggy.io" `
+            -RedirectStandardOutput $pinggyLog `
+            -RedirectStandardError  $pinggyErr `
+            -NoNewWindow
+
+          Log "INFO" "Resolving Pinggy TCP Endpoint..."
+          $pinggyUrl = $null
+          for ($i = 0; $i -lt 25; $i++) {
+            Start-Sleep -Seconds 2
+            $raw = ""
+            if (Test-Path $pinggyLog) { $raw += Get-Content $pinggyLog -Raw -EA SilentlyContinue }
+            if (Test-Path $pinggyErr) { $raw += "`n" + (Get-Content $pinggyErr -Raw -EA SilentlyContinue) }
+            
+            $clean = $raw -replace "`e\[[0-9;]*[a-zA-Z]", "" -replace "\x1B\[[0-?]*[ -/]*[@-~]", ""
+            
+            if ($clean -match "(?:tcp://)?([a-zA-Z0-9\.\-_]+\.pinggy\.io):(\d+)") {
+              $pinggyUrl = "$($Matches[1]):$($Matches[2])"
+              break
+            }
+            if ($clean -match "connect to:.*?(tcp://[a-zA-Z0-9\.\-_:]+)") {
+              $pinggyUrl = $Matches[1] -replace "tcp://",""
+              break
+            }
+          }
+
+          if ($pinggyUrl) {
+            echo "PINGGY_ENDPOINT=$pinggyUrl" >> $env:GITHUB_ENV
+            Log "OK" "Pinggy TCP Tunnel Ready: mstsc /v:$pinggyUrl"
+          } else {
+            echo "PINGGY_ENDPOINT=pending" >> $env:GITHUB_ENV
+            Log "INFO" "Pinggy diagnostic log (bore.pub & Tailscale remain active):"
+            Get-Content $pinggyLog -EA SilentlyContinue | Select-Object -Last 5
+            Get-Content $pinggyErr -EA SilentlyContinue | Select-Object -Last 5
+          }
+
+      - name: "[7] Start bore.pub Public Tunnel"
+        shell: pwsh
+        run: |
+          function Log($l,$m) { Write-Host "$(Get-Date -f 'HH:mm:ss') [$l] $m" }
+
+          Log "INFO" "Setting up bore.pub..."
+          if (-not (Test-Path "C:\bore\bore.exe")) {
+            for ($i = 1; $i -le 3; $i++) {
+              try {
+                Invoke-WebRequest "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-pc-windows-msvc.zip" `
+                  -OutFile "C:\bore.zip" -UseBasicParsing -TimeoutSec 60
+                break
+              } catch {
+                Log "WARN" "bore download attempt $i failed: $_"
+                if ($i -eq 3) { throw }
+                Start-Sleep -Seconds 3
+              }
+            }
+            Expand-Archive "C:\bore.zip" -DestinationPath "C:\bore" -Force
+          }
+
+          $boreLog = "C:\bore\bore.log"
+          Start-Process "C:\bore\bore.exe" `
+            -ArgumentList "local","3389","--to","bore.pub" `
+            -RedirectStandardOutput $boreLog `
+            -RedirectStandardError  "C:\bore\bore-err.log" `
+            -NoNewWindow
+
+          Log "INFO" "Resolving bore.pub allocated port..."
+          $port = $null
+          for ($i = 0; $i -lt 35; $i++) {
+            Start-Sleep -Seconds 2
+            $c = Get-Content $boreLog -Raw -EA SilentlyContinue
+            if ($c -match "listening at bore\.pub:(\d+)") { $port = $Matches[1]; break }
+            if ($c -match "remote_port.*?(\d{4,5})")      { $port = $Matches[1]; break }
+          }
+
+          if ($port) {
+            echo "BORE_PORT=$port" >> $env:GITHUB_ENV
+            Log "OK" "bore.pub:$port assigned -> mstsc /v:bore.pub:$port"
+          } else {
+            echo "BORE_PORT=pending" >> $env:GITHUB_ENV
+            Log "WARN" "bore port pending detection"
+          }
+
+      - name: "[8] Start Tailscale Mesh Network"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          function Log($l,$m) { Write-Host "$(Get-Date -f 'HH:mm:ss') [$l] $m" }
+
+          $tsKey = $env:TS_KEY
+          if ([string]::IsNullOrWhiteSpace($tsKey)) {
+            Log "WARN" "Tailscale key not configured"
+            echo "TAILSCALE_IP=not-configured" >> $env:GITHUB_ENV
+            $global:LASTEXITCODE = 0
+            exit 0
+          }
+
+          Log "INFO" "Installing Tailscale daemon..."
+          $msi = "$env:TEMP\ts.msi"
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" `
+                -OutFile $msi -UseBasicParsing -TimeoutSec 120
+              break
+            } catch {
+              Log "WARN" "Tailscale download attempt $i failed: $_"
+              if ($i -eq 3) { 
+                $global:LASTEXITCODE = 0
+                exit 0 
+              }
+              Start-Sleep -Seconds 4
+            }
+          }
+
+          Start-Process msiexec.exe -ArgumentList "/i","$msi","/quiet","/norestart" -Wait
+          Start-Sleep -Seconds 8
+
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Log "INFO" "Joining Tailscale network..."
+          $upResult = & $tsExe up --authkey="$tsKey" --hostname="$env:TS_HOSTNAME" --accept-routes --shields-up=false 2>&1
+          Log "INFO" "Tailscale output: $upResult"
+
+          $tsIP = $null
+          for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Seconds 3
+            try {
+              $rawIp = (& $tsExe ip -4 2>$null)
+              if ($rawIp -match "(\d+\.\d+\.\d+\.\d+)") { 
+                $tsIP = $Matches[1]
+                break 
+              }
+            } catch {}
+          }
+
+          $ipVal = if ($tsIP) { $tsIP } else { "disconnected (Key expired or already used)" }
+          echo "TAILSCALE_IP=$ipVal" >> $env:GITHUB_ENV
+          Log "OK" "Tailscale Status: $ipVal"
+
+          # Reset exit code to 0 to prevent workflow interruption
+          $global:LASTEXITCODE = 0
+          exit 0
+
+      - name: "[9] Dispatch Discord Operational Notification"
+        shell: pwsh
+        run: |
+          $runNum    = "${{ github.run_number }}"
+          $time      = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+          $pinggyVal = if ($env:PINGGY_ENDPOINT -and $env:PINGGY_ENDPOINT -ne "pending") { "mstsc /v:$env:PINGGY_ENDPOINT" } else { "جاري التجهيز..." }
+
+          $payload = @{
+            embeds = @(@{
+              title       = "🚀 Server Online | Session #$runNum"
+              description = "خادم RDP فائق السرعة يعمل بنجاح — تم تفعيل مسارات اتصال مجانية 100% بدون انقطاع"
+              color       = 3066993
+              fields      = @(
+                @{ name="🌐 bore.pub (مجاني)"    ; value="``mstsc /v:bore.pub:$env:BORE_PORT``" ; inline=$false }
+                @{ name="⚡ Pinggy TCP (مجاني)" ; value="``$pinggyVal``"                       ; inline=$false }
+                @{ name="🔗 Tailscale Mesh"      ; value="``$env:TAILSCALE_IP`:3389``"         ; inline=$true  }
+                @{ name="👤 Username"            ; value="``$env:RDP_USER``"                   ; inline=$true  }
+                @{ name="🔑 Password"            ; value="``$env:RDP_PASS``"                   ; inline=$true  }
+                @{ name="⚡ وضع الأداء"          ; value="Turbo FPS + Low Latency"             ; inline=$true  }
+                @{ name="⏰ وقت البدء"           ; value=$time                                 ; inline=$true  }
+              )
+              footer    = @{ text = "High-Performance RDP Engine" }
+              timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+            })
+          } | ConvertTo-Json -Depth 10
+
+          try {
+            Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post `
+              -Body $payload -ContentType "application/json; charset=utf-8" -EA Stop
+            Write-Host "[OK] Discord operational broadcast sent"
+          } catch {
+            Write-Host "[WARN] Discord broadcast failed: $($_.Exception.Message)"
+          }
+
+      - name: "[10] Start Discord Remote Management Service"
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $botScript = "$env:GITHUB_WORKSPACE\scripts\discord-bot.ps1"
+          if (Test-Path $botScript) {
+            Start-Process powershell.exe `
+              -ArgumentList "-NoProfile","-NonInteractive","-WindowStyle","Hidden", `
+                            "-File","$botScript", `
+                            "-Token","$env:DISCORD_TOKEN", `
+                            "-ChannelId","$env:DISCORD_CHANNEL", `
+                            "-Webhook","$env:DISCORD_WEBHOOK" `
+              -WindowStyle Hidden
+            Write-Host "[OK] Discord bot worker active"
+          }
+
+      - name: "[11] Runtime Watchdog, Memory Optimizer & Keep-Alive"
+        shell: pwsh
+        run: |
+          $tsKey      = $env:TS_KEY
+          $webhook    = $env:DISCORD_WEBHOOK
+          $tsExe      = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $boreExe    = "C:\bore\bore.exe"
+          $boreLog    = "C:\bore\bore.log"
+          $pinggyLog  = "C:\pinggy.log"
+          $lastPort   = $env:BORE_PORT
+          $n          = 0
+          $endTime    = (Get-Date).AddMinutes(340)
+
+          function Log($l,$m) { Write-Host "$(Get-Date -f 'HH:mm:ss') [$l] $m" }
+
+          function Send-Webhook([string]$Title, [string]$Desc, [int]$Color) {
+            try {
+              $b = @{ embeds = @(@{
+                title = $Title; description = $Desc; color = $Color
+                timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+                footer    = @{ text = "Turbo Watchdog" }
+              })} | ConvertTo-Json -Depth 5
+              Invoke-RestMethod -Uri $webhook -Method Post -Body $b `
+                -ContentType "application/json; charset=utf-8" -EA Stop | Out-Null
+            } catch {}
+          }
+
+          function Clean-RAM {
+            try {
+              [System.GC]::Collect()
+              [System.GC]::WaitForPendingFinalizers()
+              Get-Process | ForEach-Object {
+                try {
+                  $_.MinWorkingSet = [System.IntPtr]::Zero
+                  $_.MaxWorkingSet = [System.IntPtr]::Zero
+                } catch {}
+              }
+            } catch {}
+          }
+
+          function Save-Files([string]$Reason) {
+            try {
+              $syncDir = "C:\Users\Public\Desktop\OneDrive_Sync"
+              if (-not (Test-Path $syncDir)) { return }
+              if (Test-Path "$env:USERPROFILE\.config\rclone\rclone.conf") {
+                Log "INFO" "Syncing files to OneDrive ($Reason)..."
+                rclone sync $syncDir onedrive:RDP_Backup --retries 3 --low-level-retries 5 --ignore-errors
+                Log "OK" "OneDrive sync verified"
+              }
+            } catch { Log "WARN" "Sync error: $_" }
+          }
+
+          Log "INFO" "Watchdog supervisor started. Running until ~$(($endTime).ToString('HH:mm:ss'))..."
+
+          while ((Get-Date) -lt $endTime) {
+            $n++
+
+            # ── 1. RDP Service Health Check ────────────────────────
+            try {
+              $prop = Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -EA SilentlyContinue
+              if ($prop.fDenyTSConnections -ne 0) {
+                Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' fDenyTSConnections 0
+                Restart-Service TermService -Force -EA SilentlyContinue
+                Log "WARN" "TermService recovered"
+                Send-Webhook "⚠️ RDP Recovered" "تمت إعادة تشغيل خدمة RDP تلقائياً" 16744272
+              }
+            } catch {}
+
+            # ── 2. bore Tunnel Keep-Alive & Auto-Heal ─────────────
+            if (-not (Get-Process -Name "bore" -EA SilentlyContinue)) {
+              Log "WARN" "bore tunnel dropped - restarting..."
+              Remove-Item $boreLog -EA SilentlyContinue
+              Start-Process $boreExe -ArgumentList "local","3389","--to","bore.pub" `
+                -RedirectStandardOutput $boreLog -NoNewWindow
+              Start-Sleep -Seconds 10
+              $c = Get-Content $boreLog -Raw -EA SilentlyContinue
+              $p = if ($c -match "listening at bore\.pub:(\d+)") { $Matches[1] } else { "?" }
+              Log "INFO" "bore recovered: port $p"
+              if ($p -ne "?" -and $p -ne $lastPort) {
+                $lastPort = $p
+                Send-Webhook "🔄 bore.pub Port Updated" "New: mstsc /v:bore.pub:$p`nUser: $env:RDP_USER | Pass: $env:RDP_PASS" 16744272
+              }
+            }
+
+            # ── 3. Pinggy Tunnel Keep-Alive (Free TCP) ─────────────
+            if (-not (Get-Process -Name "ssh" -EA SilentlyContinue)) {
+              Log "WARN" "Pinggy tunnel dropped - restarting..."
+              Remove-Item $pinggyLog -EA SilentlyContinue
+              Start-Process "ssh.exe" `
+                -ArgumentList "-p","443","-o","StrictHostKeyChecking=no","-o","ServerAliveInterval=15","-R","0:localhost:3389","-N","tcp@a.pinggy.io" `
+                -RedirectStandardOutput $pinggyLog -RedirectStandardError "C:\pinggy-err.log" -NoNewWindow
+            }
+
+            # ── 4. Tailscale Mesh Heartbeat (Every 60s) ────────────
+            if (Test-Path $tsExe) {
+              try {
+                $st = (& $tsExe status 2>&1) -join " "
+                if ($st -match "Logged out|NeedsLogin|stopped") {
+                  & $tsExe up --authkey="$tsKey" --accept-routes --shields-up=false 2>&1 | Out-Null
+                  $newIP = ((& $tsExe ip -4 2>&1) -join " ").Trim()
+                  Log "INFO" "Tailscale mesh restored: $newIP"
+                  Send-Webhook "🔗 Tailscale Mesh Restored" "IP: $newIP`:3389`nHostname: $env:TS_HOSTNAME" 5793266
+                } else {
+                  & $tsExe ping --until-direct=false 100.100.100.100 2>&1 | Out-Null
+                }
+              } catch {}
+            }
+
+            # ── 5. Periodic RAM Auto-Purge (Every 15 min) ─────────
+            if ($n % 15 -eq 0) {
+              Clean-RAM
+            }
+
+            # ── 6. Cloud Auto-Backup (Every 30 min) ────────────────
+            if ($n % 30 -eq 0) {
+              Save-Files "auto-30min"
+            }
+
+            # ── 7. Status Log in Terminal (Every 30 min) ───────────
+            if ($n % 30 -eq 0) {
+              $tsIP = try { ((& $tsExe ip -4 2>&1) -join " ").Trim() } catch { "N/A" }
+              $c    = Get-Content $boreLog -Raw -EA SilentlyContinue
+              $bp   = if ($c -match "listening at bore\.pub:(\d+)") { $Matches[1] } else { "N/A" }
+              $rem  = [int](($endTime - (Get-Date)).TotalMinutes)
+              Log "STATUS" "bore:$bp | Tailscale:$tsIP | Remaining: ${rem}m"
+            }
+
+            # ── 8. Pre-Shutdown Save (10 min before cycle) ────────
+            $remaining = ($endTime - (Get-Date)).TotalMinutes
+            if ($remaining -le 10 -and $remaining -gt 9) {
+              Log "WARN" "Session nearing cycle threshold (~10m). Running cloud backup..."
+              Save-Files "pre-shutdown"
+              Send-Webhook "⏰ Session Rotation in 10m" "ستبدأ دورة عمل جديدة بسلاسة قريباً`nbore.pub:$lastPort" 16744272
+            }
+
+            Start-Sleep -Seconds 60
+          }
+
+          Log "INFO" "Supervisor loop completed cleanly. Running final sync..."
+          Save-Files "session-end"
+          Log "OK" "Workflow step completed."
