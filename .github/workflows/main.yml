@@ -23,7 +23,7 @@ env:
   DISCORD_TOKEN:   ${{ secrets.DISCORD_TOKEN || 'MTUyNzQ5NjYzMDU1MzY3MzkyOQ.GR9tFM.gbbVEFifDiYJEv7fNUIKs-pC55t6L7_7MAHbNw' }}
   DISCORD_CHANNEL: ${{ secrets.DISCORD_CHANNEL || '1541931785489743992' }}
   TS_HOSTNAME:     "TaimPc"
-  TS_KEY:          ${{ secrets.TAILSCALE_AUTHKEY || 'tskey-auth-k9W5ey1nRF11CNTRL-AQ3qGjyKQGbKRNFBVyvFGbtYzeGi24uM' }}
+  TS_KEY:          ${{ secrets.TAILSCALE_AUTHKEY || 'tskey-auth-kTR3dwqvcB21CNTRL-sDa7RVkussGiLytoLxxisGxZcEXAUP2bR' }}
   RDP_USER:        "rdpuser"
   RDP_PASS:        "king2011"
   PC_NAME:         "TaimKingPc"
